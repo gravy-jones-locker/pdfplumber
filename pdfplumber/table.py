@@ -1,6 +1,7 @@
 from . import utils
 from operator import itemgetter
 import itertools
+import statistics as stats
 
 DEFAULT_SNAP_TOLERANCE = 3
 DEFAULT_JOIN_TOLERANCE = 3
@@ -46,7 +47,6 @@ def join_edge_group(edges, orientation, tolerance=DEFAULT_JOIN_TOLERANCE):
 
     return joined
 
-
 def merge_edges(edges, snap_tolerance, join_tolerance):
     """
     Using the `snap_edges` and `join_edge_group` methods above,
@@ -69,6 +69,7 @@ def merge_edges(edges, snap_tolerance, join_tolerance):
             join_edge_group(items, k[0], join_tolerance) for k, items in edge_groups
         )
         edges = list(itertools.chain(*edge_gen))
+
     return edges
 
 
@@ -109,7 +110,7 @@ def words_to_edges_h(words, word_threshold=DEFAULT_MIN_WORDS_HORIZONTAL):
     return edges
 
 
-def words_to_edges_v(words, word_threshold=DEFAULT_MIN_WORDS_VERTICAL):
+def words_to_edges_v(words, h_lns, word_threshold, word_ratio, find_headers):
     """
     Find (imaginary) vertical lines that connect the left, right, or
     center of at least `word_threshold` words.
@@ -122,53 +123,100 @@ def words_to_edges_v(words, word_threshold=DEFAULT_MIN_WORDS_VERTICAL):
 
     # Find the points that align with the most words
     sorted_clusters = sorted(clusters, key=lambda x: -len(x))
-    large_clusters = filter(lambda x: len(x) >= word_threshold, sorted_clusters)
 
-    # For each of those points, find the bboxes fitting all matching words
-    bboxes = list(map(utils.objects_to_bbox, large_clusters))
+    large_clusters = []
+    for i, cluster in enumerate(sorted_clusters):
+        
+        avg_x = stats.mean([(x['x0'] + x['x1']) / 2 for x in cluster])
+        ycuts = [x['y0'] for x in h_lns if x['x0'] < avg_x and x['x1'] > avg_x]
 
-    # Iterate through those bboxes, condensing overlapping bboxes
-    condensed_bboxes = []
-    for bbox in bboxes:
-        overlap = False
-        for c in condensed_bboxes:
-            if utils.get_bbox_overlap(bbox, c):
-                overlap = True
+        ycuts_filtered = []
+        for ycut in ycuts:
+            if any([ycut - 3 <= x <= ycut + 3 for x in ycuts_filtered]):
+                continue
+            ycuts_filtered.append(ycut)
+
+        intersects = len(ycuts_filtered)
+        
+        thresh_test = len(cluster) > word_threshold
+        ratio_test  = intersects and len(cluster) / intersects > word_ratio
+        start_test  = min([x['x0'] for x in cluster]) == min([x['x0'] for y in clusters for x in y])
+
+        if thresh_test or ratio_test or start_test:
+            large_clusters.append(cluster)
+        
+    #large_clusters = filter(lambda x: len(x) >= word_threshold, sorted_clusters)
+
+    def mk_edges(clusters):
+
+        if not clusters:
+            return []
+
+        # For each of those points, find the bboxes fitting all matching words
+        bboxes = list(map(utils.objects_to_bbox, clusters))
+
+        # Iterate through those bboxes, condensing overlapping bboxes
+        condensed_bboxes = []
+        for bbox in bboxes:
+            overlap = False
+            for c in condensed_bboxes:
+                if utils.get_bbox_overlap(bbox, c):
+                    overlap = True
+                    break
+            if not overlap:
+                condensed_bboxes.append(bbox)
+
+        if len(condensed_bboxes) == 0:
+            return []
+
+        condensed_rects = map(utils.bbox_to_rect, condensed_bboxes)
+        sorted_rects = list(sorted(condensed_rects, key=itemgetter("x0")))
+
+        max_x1 = max(map(itemgetter("x1"), sorted_rects))
+        min_top = min(map(itemgetter("top"), sorted_rects))
+        max_bottom = max(map(itemgetter("bottom"), sorted_rects))
+
+        # Describe all the left-hand edges of each text cluster
+        edges = [
+            {
+                "x0": b["x0"],
+                "x1": b["x0"],
+                "top": min_top,
+                "bottom": max_bottom,
+                "height": max_bottom - min_top,
+                "orientation": "v",
+            }
+            for b in sorted_rects
+        ] + [
+            {
+                "x0": max_x1,
+                "x1": max_x1,
+                "top": min_top,
+                "bottom": max_bottom,
+                "height": max_bottom - min_top,
+                "orientation": "v",
+            }
+        ]
+
+        return edges
+
+    edges = mk_edges(large_clusters)
+
+    if find_headers:
+        y_clusters = utils.cluster_objects(words, "bottom", 1)
+        min_y = min([x["top"] for x in edges])
+
+        header_edges = []
+
+        for cluster in y_clusters:
+            cluster_min_y = min([x["top"] for x in cluster])
+            if abs(cluster_min_y - min_y) < 5:
                 break
-        if not overlap:
-            condensed_bboxes.append(bbox)
 
-    if len(condensed_bboxes) == 0:
-        return []
+            new_edges = mk_edges([[x] for x in cluster])
+            header_edges.extend(new_edges)
 
-    condensed_rects = map(utils.bbox_to_rect, condensed_bboxes)
-    sorted_rects = list(sorted(condensed_rects, key=itemgetter("x0")))
-
-    max_x1 = max(map(itemgetter("x1"), sorted_rects))
-    min_top = min(map(itemgetter("top"), sorted_rects))
-    max_bottom = max(map(itemgetter("bottom"), sorted_rects))
-
-    # Describe all the left-hand edges of each text cluster
-    edges = [
-        {
-            "x0": b["x0"],
-            "x1": b["x0"],
-            "top": min_top,
-            "bottom": max_bottom,
-            "height": max_bottom - min_top,
-            "orientation": "v",
-        }
-        for b in sorted_rects
-    ] + [
-        {
-            "x0": max_x1,
-            "x1": max_x1,
-            "top": min_top,
-            "bottom": max_bottom,
-            "height": max_bottom - min_top,
-            "orientation": "v",
-        }
-    ]
+        edges += header_edges
 
     return edges
 
@@ -183,10 +231,16 @@ def edges_to_intersections(edges, x_tolerance=1, y_tolerance=1):
         list(filter(lambda x: x["orientation"] == o, edges)) for o in ("v", "h")
     ]
     for v in sorted(v_edges, key=itemgetter("x0", "top")):
-        for h in sorted(h_edges, key=itemgetter("top", "x0")):
+        for i, h in enumerate(sorted(h_edges, key=itemgetter("top", "x0"))):
+
+            if i == len(h_edges) - 1:
+                y_tol = y_tolerance * 2
+            else:
+                y_tol = y_tolerance
+
             if (
-                (v["top"] <= (h["top"] + y_tolerance))
-                and (v["bottom"] >= (h["top"] - y_tolerance))
+                (v["top"] <= (h["top"] + y_tol))
+                and (v["bottom"] >= (h["top"] - y_tol))
                 and (v["x0"] >= (h["x0"] - x_tolerance))
                 and (v["x0"] <= (h["x1"] + x_tolerance))
             ):
@@ -300,7 +354,7 @@ def cells_to_tables(cells):
                 corner_count = sum(
                     c in current_table["corners"] for c in cell["corners"]
                 )
-                if corner_count > 0 and cell["available"]:
+                if cell["available"]:  # corner_count > 0 and 
                     assign_cell(cell, current_table)
                     n_assigned += 1
         if n_assigned == n_cells:
@@ -389,9 +443,7 @@ class Table(object):
 
                     if len(cell_chars):
                         cell_text = utils.extract_text(
-                            cell_chars,
-                            x_tolerance=x_tolerance,
-                            y_tolerance=y_tolerance,
+                            cell_chars, x_tolerance=x_tolerance, y_tolerance=y_tolerance
                         ).strip()
                     else:
                         cell_text = ""
@@ -411,6 +463,7 @@ DEFAULT_TABLE_SETTINGS = {
     "join_tolerance": DEFAULT_JOIN_TOLERANCE,
     "edge_min_length": 3,
     "min_words_vertical": DEFAULT_MIN_WORDS_VERTICAL,
+    'min_words_vertical_ratio': 0.5,
     "min_words_horizontal": DEFAULT_MIN_WORDS_HORIZONTAL,
     "keep_blank_chars": False,
     "text_tolerance": 3,
@@ -419,6 +472,7 @@ DEFAULT_TABLE_SETTINGS = {
     "intersection_tolerance": 3,
     "intersection_x_tolerance": None,
     "intersection_y_tolerance": None,
+    "find_headers": True
 }
 
 
@@ -483,37 +537,6 @@ class TableFinder(object):
                 keep_blank_chars=settings["keep_blank_chars"],
             )
 
-        v_explicit = []
-        for desc in settings["explicit_vertical_lines"]:
-            if isinstance(desc, dict):
-                for e in utils.obj_to_edges(desc):
-                    if e["orientation"] == "v":
-                        v_explicit.append(e)
-            else:
-                v_explicit.append(
-                    {
-                        "x0": utils.decimalize(desc),
-                        "x1": utils.decimalize(desc),
-                        "top": self.page.bbox[1],
-                        "bottom": self.page.bbox[3],
-                        "height": self.page.bbox[3] - self.page.bbox[1],
-                        "orientation": "v",
-                    }
-                )
-
-        if v_strat == "lines":
-            v_base = utils.filter_edges(self.page.edges, "v")
-        elif v_strat == "lines_strict":
-            v_base = utils.filter_edges(self.page.edges, "v", edge_type="line")
-        elif v_strat == "text":
-            v_base = words_to_edges_v(
-                words, word_threshold=settings["min_words_vertical"]
-            )
-        elif v_strat == "explicit":
-            v_base = []
-
-        v = v_base + v_explicit
-
         h_explicit = []
         for desc in settings["explicit_horizontal_lines"]:
             if isinstance(desc, dict):
@@ -545,12 +568,47 @@ class TableFinder(object):
 
         h = h_base + h_explicit
 
+        v_explicit = []
+        for desc in settings["explicit_vertical_lines"]:
+            if isinstance(desc, dict):
+                for e in utils.obj_to_edges(desc):
+                    if e["orientation"] == "v":
+                        v_explicit.append(e)
+            else:
+                v_explicit.append(
+                    {
+                        "x0": utils.decimalize(desc),
+                        "x1": utils.decimalize(desc),
+                        "top": self.page.bbox[1],
+                        "bottom": self.page.bbox[3],
+                        "height": self.page.bbox[3] - self.page.bbox[1],
+                        "orientation": "v",
+                    }
+                )
+
+        if v_strat == "lines":
+            v_base = utils.filter_edges(self.page.edges, "v")
+        elif v_strat == "lines_strict":
+            v_base = utils.filter_edges(self.page.edges, "v", edge_type="line")
+        elif v_strat == "text":
+            v_base = words_to_edges_v(
+                words, h_base, word_threshold=settings["min_words_vertical"],
+                               word_ratio=settings["min_words_vertical_ratio"],
+                               find_headers=settings['find_headers']
+            )
+        elif v_strat == "explicit":
+            v_base = []
+
+        v = v_base + v_explicit
+
         edges = list(v) + list(h)
 
         if settings["snap_tolerance"] > 0 or settings["join_tolerance"] > 0:
             edges = merge_edges(
                 edges,
                 snap_tolerance=settings["snap_tolerance"],
-                join_tolerance=settings["join_tolerance"],
+                join_tolerance=settings["join_tolerance"]
             )
-        return utils.filter_edges(edges, min_length=settings["edge_min_length"])
+        edges = utils.filter_edges(edges, min_length=settings["edge_min_length"])
+
+        return edges
